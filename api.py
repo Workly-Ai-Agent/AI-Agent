@@ -15,6 +15,7 @@ class WorkflowRequest(BaseModel):
     project_name: str
     plan_text: str
     employees: list[Employee] = Field(default_factory=list)
+    mode: str = "REPLAN"
 
 class MessengerRequest(BaseModel):
     message: str
@@ -32,6 +33,7 @@ def workflow(request: WorkflowRequest) -> dict[str, Any]:
         result = run(
             {"name": request.project_name, "plan_text": request.plan_text},
             [employee.model_dump() for employee in request.employees],
+            request.mode,
         )
         return {
             "status": "PENDING_APPROVAL" if result.get("approval_required") else "READY",

@@ -25,12 +25,15 @@ MAX_REPLAN_ROUNDS = 1
 
 class TaskItem(BaseModel):
     task: str
+    task_reference: Optional[str] = None
     description: str = ""
     required_skills: List[str] = Field(default_factory=list)
     depends_on: List[str] = Field(default_factory=list)
     start_at: Optional[str] = None
     due_at: Optional[str] = None
     priority: Literal["LOW", "MEDIUM", "HIGH", "URGENT"] = "MEDIUM"
+    status: Optional[Literal["TODO", "IN_PROGRESS", "COMPLETED", "BLOCKED", "CANCELLED"]] = None
+    changes: List[Literal["title", "description", "assignee", "priority", "start_at", "due_at", "depends_on", "status"]] = Field(default_factory=list)
 
 
 class TaskPlan(BaseModel):
@@ -68,6 +71,7 @@ class MessengerIntent(BaseModel):
 class AgentState(TypedDict, total=False):
     project_name: str
     plan_text: str
+    proposal_mode: str
     employees: list[dict[str, Any]]
     tasks: list[dict[str, Any]]
     assignments: list[dict[str, Any]]
@@ -87,8 +91,16 @@ def llm():
 
 def planner_node(state: AgentState) -> AgentState:
     skills = sorted({skill for employee in state["employees"] for skill in employee.get("skills", [])})
+    mode = state.get("proposal_mode")
+    scope = (
+        "Create only 1-3 genuinely new tasks requested by the user. Do not restate existing tasks."
+        if mode == "ADD_TASKS"
+        else "Inspect the chat request and current task list. Return only impacted tasks, up to 5. For a change to an existing task, set task_reference to its exact current title; keep task equal to the current title unless the user explicitly requests a rename. List only explicitly requested fields in changes. Do not return or alter unaffected tasks. For new work, return a new task."
+        if mode == "CHAT_UPDATE"
+        else "Break the project into 3-12 actionable tasks."
+    )
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are a project task planner. Break the project into 3-12 actionable tasks.
+        ("system", f"""You are a project task planner. {scope}
 Create concrete tasks with a clear, practical description explaining the goal and expected work, required skills, dependencies, and priority. Set start_at and due_at only when dates or a project schedule are provided; use ISO 8601 local date-time strings. Never invent dates. Return structured output."""),
         ("user", "Project: {name}\nPlan: {plan}\nAvailable skills: {skills}"),
     ])
@@ -104,11 +116,12 @@ Create concrete tasks with a clear, practical description explaining the goal an
 def assignment_node(state: AgentState) -> AgentState:
     prompt = ChatPromptTemplate.from_messages([
         ("system", """You are an assignment agent. Assign each task to the best available employee.
-Prioritize skill overlap, then prefer employees with lower current_workload when candidates have similar skills. Always choose one of the provided employees when employees exist.
+If the user's request explicitly says who will own a task, honor that assignment when that person is one of the provided employees. Otherwise prioritize skill overlap, then prefer employees with lower current_workload when candidates have similar skills. Always choose one of the provided employees when employees exist.
 Explain every decision in reason. Return structured output."""),
-        ("user", "Tasks:\n{tasks}\nEmployees:\n{employees}\nValidator feedback:\n{feedback}"),
+        ("user", "User request:\n{plan}\n\nTasks:\n{tasks}\nEmployees:\n{employees}\nValidator feedback:\n{feedback}"),
     ])
     result = (prompt | llm().with_structured_output(AssignmentPlan)).invoke({
+        "plan": state.get("plan_text", ""),
         "tasks": json.dumps(state["tasks"], ensure_ascii=False),
         "employees": json.dumps(state["employees"], ensure_ascii=False),
         "feedback": " / ".join(state.get("violations", [])),
@@ -125,7 +138,7 @@ def jev_assignments(state: AgentState, fallback: list[dict[str, Any]]) -> list[d
         return fallback
 
     criteria = {
-        employee["name"]: f"Match required skills and prefer lower current workload ({employee.get('current_workload', 0)} active tasks)"
+        employee["name"]: f"Honor an explicitly named owner in this user request: {state.get('plan_text', '')}. Otherwise match required skills and prefer lower current workload ({employee.get('current_workload', 0)} active tasks)."
         for employee in state["employees"]
     }
     assignments_by_task = {item["task"]: item for item in fallback}
@@ -286,9 +299,10 @@ def extract_skills(text: str) -> SkillExtraction:
     return (prompt | llm().with_structured_output(SkillExtraction)).invoke({"text": text})
 
 
-def run(project: dict[str, Any], employees: list[dict[str, Any]]) -> dict[str, Any]:
+def run(project: dict[str, Any], employees: list[dict[str, Any]], mode: str = "REPLAN") -> dict[str, Any]:
     initial: AgentState = {
         "project_name": project["name"], "plan_text": project["plan_text"],
+        "proposal_mode": mode,
         "employees": employees,
         "tasks": [], "assignments": [], "violations": [], "monitoring": [],
         "round": 0, "approved": False, "approval_required": True, "log": [],
