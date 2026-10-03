@@ -28,6 +28,9 @@ class TaskItem(BaseModel):
     description: str = ""
     required_skills: List[str] = Field(default_factory=list)
     depends_on: List[str] = Field(default_factory=list)
+    start_at: Optional[str] = None
+    due_at: Optional[str] = None
+    priority: Literal["LOW", "MEDIUM", "HIGH", "URGENT"] = "MEDIUM"
 
 
 class TaskPlan(BaseModel):
@@ -43,6 +46,15 @@ class AssignmentItem(BaseModel):
 
 class AssignmentPlan(BaseModel):
     assignments: List[AssignmentItem]
+
+
+class ExtractedSkill(BaseModel):
+    name: str
+    evidence: str = ""
+
+
+class SkillExtraction(BaseModel):
+    skills: List[ExtractedSkill] = Field(default_factory=list)
 
 
 class MessengerIntent(BaseModel):
@@ -77,7 +89,7 @@ def planner_node(state: AgentState) -> AgentState:
     skills = sorted({skill for employee in state["employees"] for skill in employee.get("skills", [])})
     prompt = ChatPromptTemplate.from_messages([
         ("system", """You are a project task planner. Break the project into 3-12 actionable tasks.
-Create concrete tasks with a clear, practical description explaining the goal and expected work, required skills, and dependencies. Do not estimate time or workload. Return structured output."""),
+Create concrete tasks with a clear, practical description explaining the goal and expected work, required skills, dependencies, and priority. Set start_at and due_at only when dates or a project schedule are provided; use ISO 8601 local date-time strings. Never invent dates. Return structured output."""),
         ("user", "Project: {name}\nPlan: {plan}\nAvailable skills: {skills}"),
     ])
     result = (prompt | llm().with_structured_output(TaskPlan)).invoke({
@@ -92,7 +104,7 @@ Create concrete tasks with a clear, practical description explaining the goal an
 def assignment_node(state: AgentState) -> AgentState:
     prompt = ChatPromptTemplate.from_messages([
         ("system", """You are an assignment agent. Assign each task to the best available employee.
-Prioritize skill overlap, but always choose one of the provided employees when employees exist. Do not leave a task unassigned because of workload or estimated hours.
+Prioritize skill overlap, then prefer employees with lower current_workload when candidates have similar skills. Always choose one of the provided employees when employees exist.
 Explain every decision in reason. Return structured output."""),
         ("user", "Tasks:\n{tasks}\nEmployees:\n{employees}\nValidator feedback:\n{feedback}"),
     ])
@@ -113,7 +125,7 @@ def jev_assignments(state: AgentState, fallback: list[dict[str, Any]]) -> list[d
         return fallback
 
     criteria = {
-        employee["name"]: "Best match for the task's required skills and current workload"
+        employee["name"]: f"Match required skills and prefer lower current workload ({employee.get('current_workload', 0)} active tasks)"
         for employee in state["employees"]
     }
     assignments_by_task = {item["task"]: item for item in fallback}
@@ -148,6 +160,10 @@ def validator_node(state: AgentState) -> AgentState:
     tasks = {task["task"]: task for task in state["tasks"]}
     load: dict[str, int] = {}
     violations: list[str] = []
+    task_list = state.get("tasks", [])
+    names = [task.get("task") for task in task_list]
+    if len(names) != len(set(names)):
+        violations.append("중복 Task 이름이 있습니다.")
     for assignment in state.get("assignments", []):
         task = tasks.get(assignment.get("task"))
         name = assignment.get("assignee")
@@ -157,12 +173,35 @@ def validator_node(state: AgentState) -> AgentState:
         if not name or name not in employees:
             violations.append(f"배정할 구성원이 없습니다: {name or assignment.get('task')}")
             continue
-        """Assignment existence is the only blocking validation in this phase."""
-        continue
         required = set(task.get("required_skills", []))
-        owned = set(employee.get("skills", []))
+        owned = set(employees[name].get("skills", []))
         if required and not required.intersection(owned):
             violations.append(f"Skill 불일치: {task['task']} -> {name}")
+    task_names = set(tasks)
+    assigned_names = {item.get("task") for item in state.get("assignments", [])}
+    for missing in task_names - assigned_names:
+        violations.append(f"담당자 추천이 누락된 Task: {missing}")
+    graph = {name: set(task.get("depends_on", [])) for name, task in tasks.items()}
+    for name, dependencies in graph.items():
+        for dependency in dependencies - task_names:
+            violations.append(f"존재하지 않는 선행 Task: {name} -> {dependency}")
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def has_cycle(name: str) -> bool:
+        if name in visiting:
+            return True
+        if name in visited:
+            return False
+        visiting.add(name)
+        if any(has_cycle(dependency) for dependency in graph.get(name, set()) if dependency in graph):
+            return True
+        visiting.remove(name)
+        visited.add(name)
+        return False
+
+    if any(has_cycle(name) for name in graph if name not in visited):
+        violations.append("Task 의존성 순환이 발견되었습니다.")
     state["violations"] = violations
     state["approved"] = not violations
     state["approval_required"] = True
@@ -202,17 +241,28 @@ def build_workflow():
 def classify_message(message: str) -> MessengerIntent:
     """Use the optional jev/typesafe classifier, with a deterministic fallback."""
     try:
-        from typesafe_sdk import Choice, Noul, Score, TypeSafeClient
+        from typesafe_sdk import Choice, TypeSafeClient
         response = TypeSafeClient().system_one(
             state=message,
             questions={
-                "agent": Choice(instructions="Which agent handles this request?", criteria={"planner": "plans tasks", "developer": "implements work", "reviewer": "reviews work"}),
-                "priority": Choice(instructions="How urgent is this?", criteria={"low": "later", "medium": "important", "high": "soon", "critical": "blocking"}),
-                "complexity": Score(instructions="How complex is this?", criteria=["simple", "moderate", "complex"]),
-                "needs_review": Noul(instructions="Does this need review?"),
+                "intent": Choice(
+                    instructions="Classify the user's message intent.",
+                    criteria={
+                        "TASK_CHANGE": "Change, update, reschedule, reassign, or otherwise modify an existing task or plan",
+                        "NEW_TASK": "Create or add a new task",
+                        "STATUS_QUERY": "Ask for task or project status without requesting changes",
+                        "GENERAL": "General discussion or a message unrelated to task management",
+                    },
+                ),
             },
         )
-        return MessengerIntent(intent="TASK_CHANGE" if response.answers["needs_review"].noul else "GENERAL", confidence=0.8)
+        intent = response.answers["intent"].choice
+        return MessengerIntent(
+            intent=intent,
+            requested_change=message if intent in ("TASK_CHANGE", "NEW_TASK") else None,
+            requires_replanning=intent == "TASK_CHANGE",
+            confidence=0.8,
+        )
     except Exception:
         lowered = message.lower()
         change_words = ("변경", "수정", "미뤄", "일정", "change", "delay", "move")
@@ -224,6 +274,16 @@ def classify_message(message: str) -> MessengerIntent:
         if "상태" in lowered or "status" in lowered:
             return MessengerIntent(intent="STATUS_QUERY", confidence=0.7)
         return MessengerIntent(intent="GENERAL", confidence=0.55)
+
+
+def extract_skills(text: str) -> SkillExtraction:
+    if not text.strip():
+        return SkillExtraction()
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """Extract explicit professional skills from the user's profile text. Return concise, reusable skill names, deduplicate synonyms, and include a short evidence phrase copied or paraphrased from the input. Do not infer skills without evidence. Return structured output."""),
+        ("user", "Profile text:\n{text}"),
+    ])
+    return (prompt | llm().with_structured_output(SkillExtraction)).invoke({"text": text})
 
 
 def run(project: dict[str, Any], employees: list[dict[str, Any]]) -> dict[str, Any]:
