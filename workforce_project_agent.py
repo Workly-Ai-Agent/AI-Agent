@@ -86,7 +86,13 @@ class AgentState(TypedDict, total=False):
 def llm():
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY가 설정되지 않았습니다.")
-    return ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), temperature=0)
+    return ChatOpenAI(
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        temperature=0,
+        # Respect provider retry-after delays for transient TPM/RPM rate limits.
+        max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "6")),
+        timeout=int(os.getenv("OPENAI_REQUEST_TIMEOUT_SECONDS", "120")),
+    )
 
 
 def planner_node(state: AgentState) -> AgentState:
