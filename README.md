@@ -39,7 +39,7 @@ export OPENAI_API_KEY="..."
 uvicorn api:app --host 0.0.0.0 --port 8000
 ```
 
-선택적으로 `OPENAI_MODEL`과 `TYPESAFE_API_KEY`를 설정할 수 있습니다. API 키는 저장소에 커밋하지 마세요.
+선택적으로 `OPENAI_MODEL`, `OPENAI_MAX_RETRIES`(기본 6회), `OPENAI_REQUEST_TIMEOUT_SECONDS`(기본 120초), `TYPESAFE_API_KEY`를 설정할 수 있습니다. 일시적인 OpenAI 요청 제한(429)은 SDK가 제공하는 대기 시간을 사용해 재시도합니다. API 키는 저장소에 커밋하지 마세요.
 
 ## Docker 실행
 
