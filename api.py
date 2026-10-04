@@ -1,10 +1,12 @@
 """HTTP API for the Workly multi-agent workflow."""
+import logging
 from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from workforce_project_agent import classify_message, extract_skills, run
 
 app = FastAPI(title="Workly Workforce Agent", version="1.0.0")
+logger = logging.getLogger("uvicorn.error")
 
 class Employee(BaseModel):
     name: str
@@ -29,12 +31,16 @@ def health() -> dict[str, str]:
 
 @app.post("/api/agent/workflow")
 def workflow(request: WorkflowRequest) -> dict[str, Any]:
+    # Uvicorn's access log is emitted only after a response starts. Log entry here
+    # so long-running model calls are visible while the request is still pending.
+    logger.info("Agent workflow received (mode=%s, employees=%d)", request.mode, len(request.employees))
     try:
         result = run(
             {"name": request.project_name, "plan_text": request.plan_text},
             [employee.model_dump() for employee in request.employees],
             request.mode,
         )
+        logger.info("Agent workflow completed (mode=%s, tasks=%d)", request.mode, len(result.get("tasks", [])))
         return {
             "status": "PENDING_APPROVAL" if result.get("approval_required") else "READY",
             "project_name": result["project_name"], "tasks": result.get("tasks", []),
@@ -43,6 +49,7 @@ def workflow(request: WorkflowRequest) -> dict[str, Any]:
             "log": result.get("log", []),
         }
     except Exception as exc:
+        logger.exception("Agent workflow failed (mode=%s)", request.mode)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 @app.post("/api/agent/messenger-intent")
